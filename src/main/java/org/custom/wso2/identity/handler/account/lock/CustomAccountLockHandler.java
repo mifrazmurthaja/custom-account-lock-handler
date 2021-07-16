@@ -6,6 +6,7 @@ import org.apache.commons.logging.LogFactory;
 import org.custom.wso2.identity.handler.account.lock.internal.CustomAccountServiceDataHolder;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
 import org.wso2.carbon.identity.application.common.model.Property;
+import org.wso2.carbon.identity.core.util.IdentityCoreConstants;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.event.IdentityEventConstants;
 import org.wso2.carbon.identity.event.IdentityEventException;
@@ -13,6 +14,7 @@ import org.wso2.carbon.identity.event.event.Event;
 import org.wso2.carbon.identity.event.handler.AbstractEventHandler;
 import org.wso2.carbon.identity.governance.IdentityGovernanceException;
 import org.wso2.carbon.identity.governance.IdentityMgtConstants;
+import org.wso2.carbon.identity.handler.event.account.lock.AccountLockHandler;
 import org.wso2.carbon.identity.handler.event.account.lock.constants.AccountConstants;
 import org.wso2.carbon.identity.handler.event.account.lock.exception.AccountLockException;
 import org.wso2.carbon.identity.handler.event.account.lock.internal.AccountServiceDataHolder;
@@ -89,7 +91,10 @@ public class CustomAccountLockHandler extends AbstractEventHandler {
             return;
         }
 
-        if (IdentityEventConstants.Event.POST_SET_USER_CLAIMS.equals(event.getEventName())) {
+        if (IdentityEventConstants.Event.PRE_SET_USER_CLAIMS.equals(event.getEventName())) {
+            handlePreSetUserClaimValues(event, userName, userStoreManager, userStoreDomainName, tenantDomain,
+                    identityProperties, maximumFailedAttempts, accountLockTime, unlockTimeRatio);
+        } else if (IdentityEventConstants.Event.POST_SET_USER_CLAIMS.equals(event.getEventName())) {
             PrivilegedCarbonContext.startTenantFlow();
             try {
                 PrivilegedCarbonContext.getThreadLocalCarbonContext().setTenantDomain(tenantDomain, true);
@@ -100,6 +105,68 @@ public class CustomAccountLockHandler extends AbstractEventHandler {
                 PrivilegedCarbonContext.endTenantFlow();
             }
         }
+    }
+
+    protected boolean handlePreSetUserClaimValues(Event event, String userName, UserStoreManager userStoreManager,
+                                                  String userStoreDomainName, String tenantDomain,
+                                                  Property[] identityProperties, int maximumFailedAttempts,
+                                                  String accountLockTime, double unlockTimeRatio)
+            throws AccountLockException {
+
+        if (lockedState.get() != null) {
+            return true;
+        }
+        Boolean existingAccountLockedValue;
+        try {
+            Map<String, String> claimValues = userStoreManager.getUserClaimValues(userName, new String[]{
+                    AccountConstants.ACCOUNT_LOCKED_CLAIM}, UserCoreConstants.DEFAULT_PROFILE);
+            existingAccountLockedValue = Boolean.valueOf(claimValues.get(AccountConstants.ACCOUNT_LOCKED_CLAIM));
+
+        } catch (UserStoreException e) {
+            throw new AccountLockException("Error occurred while retrieving " + AccountConstants
+                    .ACCOUNT_LOCKED_CLAIM + " claim value", e);
+        }
+        String newStateString = ((Map<String, String>) event.getEventProperties().get("USER_CLAIMS")).get(AccountConstants.ACCOUNT_LOCKED_CLAIM);
+        if (StringUtils.isNotBlank(newStateString)) {
+            Boolean newAccountLockedValue = Boolean.parseBoolean(
+                    ((Map<String, String>) event.getEventProperties().get("USER_CLAIMS"))
+                            .get(AccountConstants.ACCOUNT_LOCKED_CLAIM));
+            if (existingAccountLockedValue != newAccountLockedValue) {
+                String accountLockedEventName;
+                if (existingAccountLockedValue) {
+                    accountLockedEventName = IdentityEventConstants.Event.PRE_UNLOCK_ACCOUNT;
+                    lockedState.set(lockedStates.UNLOCKED_MODIFIED.toString());
+                    if (event.getEventProperties().get("USER_CLAIMS") != null) {
+                        ((Map<String, String>) event.getEventProperties().get("USER_CLAIMS")).put(AccountConstants.
+                                ACCOUNT_LOCKED_REASON_CLAIM_URI, StringUtils.EMPTY);
+                        if (StringUtils.isNotEmpty(getClaimValue(userName, userStoreManager,
+                                AccountConstants.ACCOUNT_UNLOCK_TIME_CLAIM))) {
+                            ((Map<String, String>) event.getEventProperties().get("USER_CLAIMS"))
+                                    .put(AccountConstants.ACCOUNT_UNLOCK_TIME_CLAIM, "0");
+                        }
+                    }
+                } else {
+                    accountLockedEventName = IdentityEventConstants.Event.PRE_LOCK_ACCOUNT;
+                    lockedState.set(lockedStates.LOCKED_MODIFIED.toString());
+                    IdentityUtil.threadLocalProperties.get().put(IdentityCoreConstants.USER_ACCOUNT_STATE,
+                            UserCoreConstants.ErrorCode.USER_IS_LOCKED);
+                }
+                publishPreAccountLockedEvent(accountLockedEventName, event.getEventProperties());
+            } else {
+                if (existingAccountLockedValue) {
+                    lockedState.set(lockedStates.LOCKED_UNMODIFIED.toString());
+                } else {
+                    lockedState.set(lockedStates.UNLOCKED_UNMODIFIED.toString());
+                }
+            }
+        } else {
+            if (existingAccountLockedValue) {
+                lockedState.set(lockedStates.LOCKED_UNMODIFIED.toString());
+            } else {
+                lockedState.set(lockedStates.UNLOCKED_UNMODIFIED.toString());
+            }
+        }
+        return true;
     }
 
     protected boolean handlePostSetUserClaimValues(Event event, String userName, UserStoreManager userStoreManager,
@@ -296,6 +363,12 @@ public class CustomAccountLockHandler extends AbstractEventHandler {
                     .ACCOUNT_DISABLED_CLAIM + " claim value", e);
         }
         return accountDisabled;
+    }
+
+    private void publishPreAccountLockedEvent(String accountLockedEventName, Map<String, Object> map) throws
+            AccountLockException {
+
+        AccountUtil.publishEvent(accountLockedEventName, AccountUtil.cloneMap(map));
     }
 
     private void publishPostAccountLockedEvent(String accountLockedEventName, Map<String, Object> map, boolean
